@@ -4,7 +4,7 @@ import csv
 class Config:
     def __init__(self):
         self.file_name = 'bus_data.csv'
-        self.num_entries = 100000
+        self.num_entries = 1000
 
     def generate_data(self):
         routes = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']

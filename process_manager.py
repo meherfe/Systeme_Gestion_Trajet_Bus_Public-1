@@ -2,7 +2,7 @@ import time
 import os
 import csv
 import psutil
-from multiprocessing import Process, cpu_count
+from multiprocessing import Process, Pipe, cpu_count
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from bus import run_bus  # Ensure `run_bus` is compatible with multiprocessing
@@ -31,30 +31,49 @@ class ProcessManager:
                 bus_data_list.append(bus_data)
         return bus_data_list
 
-    def process_multithreaded(self, bus_data_list):
-        # Using max_workers equal to twice the CPU count, for instance, to allow parallelism
-        max_workers = cpu_count() * 2
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for bus_data in bus_data_list:
-                executor.submit(run_bus, None, bus_data)
-        return max_workers
+    def process_with_threads(self, bus_data_list):
+        # Execute each bus simulation sequentially, no threads or pool
+        for bus_data in bus_data_list:
+            run_bus(None, bus_data)
+        return 1  # One thread used
 
-    def process_multiprocessing(self, bus_data_list):
+    def process_with_thread_pool(self, data_chunk, max_workers, conn):
+        # Multi-threaded execution within a single process
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(run_bus, None, bus_data) for bus_data in data_chunk]
+            for future in futures:
+                future.result()  # Wait for each thread to complete
+                conn.send("Bus processed successfully.")
+        conn.close()  # Close the connection after processing
+
+    def process_multiprocessing_with_threads(self, bus_data_list):
+        num_processes = cpu_count()
+        chunk_size = len(bus_data_list) // num_processes
+        chunks = [bus_data_list[i * chunk_size: (i + 1) * chunk_size] for i in range(num_processes)]
+        
         processes = []
-        for index, bus_data in enumerate(bus_data_list):
-            process = Process(target=run_bus, args=(None, bus_data))
+        parent_conns = []
+        for chunk in chunks:
+            parent_conn, child_conn = Pipe()
+            process = Process(target=self.process_with_thread_pool, args=(chunk, cpu_count(), child_conn))
             processes.append(process)
+            parent_conns.append(parent_conn)
             process.start()
 
-            # Limit the number of active processes to the number of CPU cores
-            if len(processes) >= cpu_count():
-                for p in processes:
-                    p.join()  # Ensure each batch completes before starting more
-                processes = []  # Clear completed processes
+        # Ensure all processes complete and collect messages
+        for process, parent_conn in zip(processes, parent_conns):
+            process.join()  # Wait for the process to complete
+            try:
+                while parent_conn.poll():  # Check for any remaining messages
+                    message = parent_conn.recv()
+                    safe_print(message)
+            except BrokenPipeError:
+                # Handle the pipe being closed by the child process
+                safe_print("Pipe was closed by the child process.")
+            finally:
+                parent_conn.close()  # Ensure connection is closed after reading
 
-        # Join any remaining processes
-        for process in processes:
-            process.join()
+        return num_processes * cpu_count()  # Total threads used across all processes
 
     def start_processes(self, use_multithreading=False):
         bus_data_list = self.load_data_from_csv('bus_data.csv')
@@ -62,12 +81,11 @@ class ProcessManager:
         cpu_usage_start = psutil.cpu_percent(interval=None)
 
         if use_multithreading:
-            safe_print("Processing with multithreading...")
-            num_threads_used = self.process_multithreaded(bus_data_list)
+            safe_print("Processing with multithreading (multiple processes and threads)...")
+            num_threads_used = self.process_multiprocessing_with_threads(bus_data_list)
         else:
-            safe_print("Processing sequentially with multiprocessing...")
-            self.process_multiprocessing(bus_data_list)
-            num_threads_used = 1  # Typically, only one main process manages workers in this mode
+            safe_print("Processing sequentially (single process, single thread)...")
+            num_threads_used = self.process_with_threads(bus_data_list)
 
         end_time = time.time()
         cpu_usage_end = psutil.cpu_percent(interval=None)
